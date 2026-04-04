@@ -1,0 +1,24 @@
+name: Sunset Cruise Check
+
+on:
+  schedule:
+    # 7 AM Pacific (15:00 UTC) and 4 PM Pacific (00:00 UTC)
+    - cron: "0 15 * * *"
+    - cron: "0 0 * * *"
+  workflow_dispatch: # allow manual runs from Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python sunset_cruise_bot.py
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

@@ -1,0 +1,17 @@
+# fly.toml — sunset-cruise-bot
+# Cron-only app: no persistent process, runs on a schedule.
+
+app = 'sunset-cruise-bot'
+primary_region = 'sjc'
+
+[build]
+
+# No always-on process
+[processes]
+
+# 7am Pacific (15:00 UTC) and 4pm Pacific (00:00 UTC)
+[[scheduled_machines]]
+  name = "sunset-check"
+  schedule = "0 15,0 * * *"
+  command = ["python", "sunset_cruise_bot.py"]
+  memory = 256
