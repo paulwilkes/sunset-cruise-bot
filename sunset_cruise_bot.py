@@ -31,7 +31,7 @@ MAX_CLOUD_COVER = 35       # percent
 TIDE_WINDOW_MINUTES = 120  # high tide must be within this many mins of sunset
 
 # How many days ahead to check
-DAYS_AHEAD = 3
+DAYS_AHEAD = 7
 
 # ── NOAA Tides ────────────────────────────────────────────────────────────────
 
