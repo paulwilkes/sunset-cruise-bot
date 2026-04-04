@@ -129,6 +129,10 @@ def check_day(date: datetime.date) -> dict | None:
     wx_data = get_weather_and_sunset(date)
     sunset = parse_sunset(wx_data)
 
+    # Skip if sunset has already passed
+    if sunset < datetime.now(TZ):
+        return None
+
     # Find high tides near sunset
     matching_highs = []
     for h in highs:
