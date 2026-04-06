@@ -118,13 +118,9 @@ def weather_at_window(data: dict, sunset: datetime, window_minutes: int = 90) ->
 
 def check_day(date: datetime.date) -> dict | None:
     """
-    Returns a result dict if conditions are golden, else None.
+    Returns a result dict if weather conditions are golden, else None.
+    Tide info is included for context but does not gate the window.
     """
-    # Tides
-    highs = get_tide_highs(date)
-    if not highs:
-        return None
-
     # Weather + sunset
     wx_data = get_weather_and_sunset(date)
     sunset = parse_sunset(wx_data)
@@ -132,24 +128,6 @@ def check_day(date: datetime.date) -> dict | None:
     # Skip if sunset has already passed
     if sunset < datetime.now(TZ):
         return None
-
-    # Find high tides near sunset
-    matching_highs = []
-    for h in highs:
-        tide_time = TZ.localize(datetime.strptime(h["t"], "%Y-%m-%d %H:%M"))
-        delta = abs((tide_time - sunset).total_seconds() / 60)
-        if delta <= TIDE_WINDOW_MINUTES:
-            matching_highs.append({
-                "time": tide_time,
-                "height_ft": float(h["v"]),
-                "minutes_from_sunset": round((tide_time - sunset).total_seconds() / 60),
-            })
-
-    if not matching_highs:
-        return None
-
-    # Best high tide (closest to sunset)
-    best_tide = min(matching_highs, key=lambda x: abs(x["minutes_from_sunset"]))
 
     # Weather check
     wx = weather_at_window(wx_data, sunset)
@@ -163,10 +141,27 @@ def check_day(date: datetime.date) -> dict | None:
     if wx["max_precip"] > 20:
         return None
 
+    # Fetch tide info for context (not a gate)
+    nearest_tide = None
+    try:
+        highs = get_tide_highs(date)
+        if highs:
+            tide_candidates = []
+            for h in highs:
+                tide_time = TZ.localize(datetime.strptime(h["t"], "%Y-%m-%d %H:%M"))
+                tide_candidates.append({
+                    "time": tide_time,
+                    "height_ft": float(h["v"]),
+                    "minutes_from_sunset": round((tide_time - sunset).total_seconds() / 60),
+                })
+            nearest_tide = min(tide_candidates, key=lambda x: abs(x["minutes_from_sunset"]))
+    except Exception as e:
+        print(f"  ⚠️ Tide fetch failed: {e}")
+
     return {
         "date": date,
         "sunset": sunset,
-        "tide": best_tide,
+        "tide": nearest_tide,
         "weather": wx,
     }
 
@@ -182,29 +177,35 @@ def post_to_discord(windows: list[dict]):
         date_str = w["date"].strftime("%A, %B %-d")
         sunset_str = w["sunset"].strftime("%-I:%M %p")
 
-        tide = w["tide"]
-        tide_str = tide["time"].strftime("%-I:%M %p")
-        tide_delta = tide["minutes_from_sunset"]
-        tide_rel = (
-            f"{abs(tide_delta)} min before sunset"
-            if tide_delta < 0
-            else f"right at sunset"
-            if tide_delta == 0
-            else f"{tide_delta} min after sunset"
-        )
-
         wx = w["weather"]
+
+        fields = [
+            {"name": "🌇 Sunset", "value": sunset_str, "inline": True},
+        ]
+
+        tide = w.get("tide")
+        if tide:
+            tide_str = tide["time"].strftime("%-I:%M %p")
+            tide_delta = tide["minutes_from_sunset"]
+            tide_rel = (
+                f"{abs(tide_delta)} min before sunset"
+                if tide_delta < 0
+                else f"right at sunset"
+                if tide_delta == 0
+                else f"{tide_delta} min after sunset"
+            )
+            fields.append({"name": "🌊 Nearest High Tide", "value": f"{tide_str} ({tide_rel})\n{tide['height_ft']:.1f} ft", "inline": True})
+
+        fields.extend([
+            {"name": "💨 Wind", "value": f"{wx['avg_wind']} mph avg", "inline": True},
+            {"name": "☁️ Cloud Cover", "value": f"{wx['avg_cloud']}%", "inline": True},
+            {"name": "🌧️ Precip Chance", "value": f"{wx['max_precip']}%", "inline": True},
+        ])
 
         embeds.append({
             "title": f"🌅 Golden Cruise Window — {date_str}",
             "color": 0xFF8C00,  # deep orange
-            "fields": [
-                {"name": "🌇 Sunset", "value": sunset_str, "inline": True},
-                {"name": "🌊 High Tide", "value": f"{tide_str} ({tide_rel})\n{tide['height_ft']:.1f} ft", "inline": True},
-                {"name": "💨 Wind", "value": f"{wx['avg_wind']} mph avg", "inline": True},
-                {"name": "☁️ Cloud Cover", "value": f"{wx['avg_cloud']}%", "inline": True},
-                {"name": "🌧️ Precip Chance", "value": f"{wx['max_precip']}%", "inline": True},
-            ],
+            "fields": fields,
             "footer": {"text": "Vashon Sunset Cruise Bot · NOAA + Open-Meteo"},
         })
 
