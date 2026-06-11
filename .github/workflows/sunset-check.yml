@@ -10,6 +10,8 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # allow the keepalive step to push a commit
     steps:
       - uses: actions/checkout@v4
 
@@ -22,3 +24,21 @@ jobs:
       - run: python sunset_cruise_bot.py
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+      # GitHub auto-disables scheduled workflows after 60 days with no commits.
+      # Push an empty commit once the repo nears that cutoff to keep it alive.
+      # Runs even if the bot step failed (if: always()).
+      - name: Keepalive
+        if: always()
+        run: |
+          age_days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Last commit was ${age_days} days ago."
+          if [ "$age_days" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (prevent 60-day workflow auto-disable)"
+            git push
+            echo "Pushed keepalive commit."
+          else
+            echo "No keepalive needed yet."
+          fi

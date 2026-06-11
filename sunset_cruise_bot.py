@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Sunset Cruise Detector — Vashon Island
-Checks NOAA tides + Open-Meteo weather for golden sunset cruise windows
-and posts alerts to Discord via webhook.
+Checks Open-Meteo weather for calm, clear sunset cruise windows
+(low wind + good visibility) and posts alerts to Discord via webhook.
 """
 
 import os
@@ -21,43 +21,18 @@ LAT = 47.44
 LON = -122.47
 TZ = pytz.timezone("America/Los_Angeles")
 
-# NOAA station — Point Defiance/Tacoma (close to south end)
-# Alternative: Seattle = 9447130
-NOAA_STATION = "9446484"
-
-# Thresholds
-MAX_WIND_MPH = 10          # ~8.7 knots
-MAX_CLOUD_COVER = 35       # percent
-TIDE_WINDOW_MINUTES = 120  # high tide must be within this many mins of sunset
+# Thresholds — what makes a good sunset cruise:
+MAX_WIND_MPH = 10          # low wind  (~8.7 knots)
+MIN_VISIBILITY_MILES = 6   # good, haze-free visibility
+MAX_PRECIP_CHANCE = 20     # percent — rain rules it out
+MAX_CLOUD_COVER = 85       # percent — clear or partly cloudy is fine; reject only
+                           # near-total overcast (no sunset to see). Raise to ~100
+                           # to stop gating on clouds entirely.
 
 # How many days ahead to check
 DAYS_AHEAD = 7
 
-# ── NOAA Tides ────────────────────────────────────────────────────────────────
-
-def get_tide_highs(date: datetime.date) -> list[dict]:
-    """Return list of high tide events for a given date."""
-    date_str = date.strftime("%Y%m%d")
-    url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-    params = {
-        "begin_date": date_str,
-        "end_date": date_str,
-        "station": NOAA_STATION,
-        "product": "predictions",
-        "datum": "MLLW",
-        "time_zone": "lst_ldt",
-        "interval": "hilo",
-        "units": "english",
-        "application": "vashon_sunset_bot",
-        "format": "json",
-    }
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    predictions = data.get("predictions", [])
-    highs = [p for p in predictions if p.get("type") == "H"]
-    return highs
-
+METERS_PER_MILE = 1609.34
 
 # ── Open-Meteo Weather + Sunset ───────────────────────────────────────────────
 
@@ -68,7 +43,10 @@ def get_weather_and_sunset(date: datetime.date) -> dict:
         "latitude": LAT,
         "longitude": LON,
         "daily": "sunset,sunrise",
-        "hourly": "cloud_cover,wind_speed_10m,precipitation_probability,weather_code",
+        "hourly": (
+            "cloud_cover,visibility,wind_speed_10m,"
+            "precipitation_probability,weather_code"
+        ),
         "wind_speed_unit": "mph",
         "timezone": "America/Los_Angeles",
         "start_date": date.isoformat(),
@@ -87,40 +65,42 @@ def parse_sunset(data: dict) -> datetime:
 
 
 def weather_at_window(data: dict, sunset: datetime, window_minutes: int = 90) -> dict:
-    """Return averaged conditions in the window around sunset."""
+    """Return conditions in the window around sunset."""
     times = data["hourly"]["time"]
     clouds = data["hourly"]["cloud_cover"]
+    visibility = data["hourly"]["visibility"]  # meters
     winds = data["hourly"]["wind_speed_10m"]
     precip = data["hourly"]["precipitation_probability"]
 
     window_start = sunset - timedelta(minutes=window_minutes // 2)
     window_end = sunset + timedelta(minutes=window_minutes // 2)
 
-    relevant_clouds, relevant_winds, relevant_precip = [], [], []
+    rel_cloud, rel_vis, rel_wind, rel_precip = [], [], [], []
     for i, t_str in enumerate(times):
         t = TZ.localize(datetime.fromisoformat(t_str))
         if window_start <= t <= window_end:
-            relevant_clouds.append(clouds[i])
-            relevant_winds.append(winds[i])
-            relevant_precip.append(precip[i])
+            rel_cloud.append(clouds[i])
+            rel_vis.append(visibility[i])
+            rel_wind.append(winds[i])
+            rel_precip.append(precip[i])
 
-    if not relevant_clouds:
+    if not rel_cloud:
         return {}
 
+    avg = lambda xs: sum(xs) / len(xs)
+
     return {
-        "avg_cloud": round(sum(relevant_clouds) / len(relevant_clouds)),
-        "avg_wind": round(sum(relevant_winds) / len(relevant_winds), 1),
-        "max_precip": max(relevant_precip),
+        "avg_cloud": round(avg(rel_cloud)),
+        "min_visibility_mi": round(min(rel_vis) / METERS_PER_MILE, 1),
+        "avg_wind": round(avg(rel_wind), 1),
+        "max_precip": max(rel_precip),
     }
 
 
 # ── Condition Checker ─────────────────────────────────────────────────────────
 
 def check_day(date: datetime.date) -> dict | None:
-    """
-    Returns a result dict if weather conditions are golden, else None.
-    Tide info is included for context but does not gate the window.
-    """
+    """Returns a result dict if it's a good cruise window, else None."""
     # Weather + sunset
     wx_data = get_weather_and_sunset(date)
     sunset = parse_sunset(wx_data)
@@ -134,34 +114,18 @@ def check_day(date: datetime.date) -> dict | None:
     if not wx:
         return None
 
-    if wx["avg_cloud"] > MAX_CLOUD_COVER:
-        return None
     if wx["avg_wind"] > MAX_WIND_MPH:
         return None
-    if wx["max_precip"] > 20:
+    if wx["min_visibility_mi"] < MIN_VISIBILITY_MILES:
         return None
-
-    # Fetch tide info for context (not a gate)
-    nearest_tide = None
-    try:
-        highs = get_tide_highs(date)
-        if highs:
-            tide_candidates = []
-            for h in highs:
-                tide_time = TZ.localize(datetime.strptime(h["t"], "%Y-%m-%d %H:%M"))
-                tide_candidates.append({
-                    "time": tide_time,
-                    "height_ft": float(h["v"]),
-                    "minutes_from_sunset": round((tide_time - sunset).total_seconds() / 60),
-                })
-            nearest_tide = min(tide_candidates, key=lambda x: abs(x["minutes_from_sunset"]))
-    except Exception as e:
-        print(f"  ⚠️ Tide fetch failed: {e}")
+    if wx["max_precip"] > MAX_PRECIP_CHANCE:
+        return None
+    if wx["avg_cloud"] > MAX_CLOUD_COVER:
+        return None
 
     return {
         "date": date,
         "sunset": sunset,
-        "tide": nearest_tide,
         "weather": wx,
     }
 
@@ -181,32 +145,17 @@ def post_to_discord(windows: list[dict]):
 
         fields = [
             {"name": "🌇 Sunset", "value": sunset_str, "inline": True},
-        ]
-
-        tide = w.get("tide")
-        if tide:
-            tide_str = tide["time"].strftime("%-I:%M %p")
-            tide_delta = tide["minutes_from_sunset"]
-            tide_rel = (
-                f"{abs(tide_delta)} min before sunset"
-                if tide_delta < 0
-                else f"right at sunset"
-                if tide_delta == 0
-                else f"{tide_delta} min after sunset"
-            )
-            fields.append({"name": "🌊 Nearest High Tide", "value": f"{tide_str} ({tide_rel})\n{tide['height_ft']:.1f} ft", "inline": True})
-
-        fields.extend([
             {"name": "💨 Wind", "value": f"{wx['avg_wind']} mph avg", "inline": True},
+            {"name": "👁️ Visibility", "value": f"{wx['min_visibility_mi']} mi", "inline": True},
             {"name": "☁️ Cloud Cover", "value": f"{wx['avg_cloud']}%", "inline": True},
             {"name": "🌧️ Precip Chance", "value": f"{wx['max_precip']}%", "inline": True},
-        ])
+        ]
 
         embeds.append({
             "title": f"🌅 Golden Cruise Window — {date_str}",
             "color": 0xFF8C00,  # deep orange
             "fields": fields,
-            "footer": {"text": "Vashon Sunset Cruise Bot · NOAA + Open-Meteo"},
+            "footer": {"text": "Vashon Sunset Cruise Bot · Open-Meteo"},
         })
 
     payload = {
@@ -229,10 +178,10 @@ def post_no_windows_summary(days_checked: int):
             "description": (
                 f"Checked the next **{days_checked} days** — "
                 "conditions aren't lining up for a sunset cruise. "
-                "Wind, clouds, or tides are working against us. Stay tuned."
+                "Wind, haze, or rain are working against us. Stay tuned."
             ),
             "color": 0x778899,  # slate grey
-            "footer": {"text": "Vashon Sunset Cruise Bot · NOAA + Open-Meteo"},
+            "footer": {"text": "Vashon Sunset Cruise Bot · Open-Meteo"},
         }]
     }
     r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
